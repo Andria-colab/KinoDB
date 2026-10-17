@@ -392,8 +392,86 @@ EXEC msdb.dbo.sp_add_jobserver
      @job_name    = N'KinoDB - Expire reservations',
      @server_name = N'(local)';
 GO
+-- Testcases 
 
+DECLARE @b1 INT, @b6 INT, @b8 INT, @expired INT, @tmp INT,
+        @today DATE = CAST(GETDATE() AS DATE),
+        @tomorrow DATE = DATEADD(DAY, 1, CAST(GETDATE() AS DATE));
 
--- =====================================================================
--- STEP 5: TESTS
--- =====================================================================
+-- 1. Book seats. Expected: new BookingID, TotalPrice 45.00, SeatsSold = 3
+EXEC dbo.usp_BookSeats @ScreeningID = 1, @CustomerID = 1, @Seats = 3, @BookingID = @b1 OUTPUT;
+SELECT b.BookingID, b.TotalPrice, b.Status, s.SeatsSold
+FROM dbo.Bookings b JOIN dbo.Screenings s ON s.ScreeningID = b.ScreeningID
+WHERE b.BookingID = @b1;
+
+-- 2 Too many seats. Expected: error 50005, SeatsSold still 3
+BEGIN TRY
+    EXEC dbo.usp_BookSeats @ScreeningID = 1, @CustomerID = 2, @Seats = 8, @BookingID = @tmp OUTPUT;
+END TRY
+BEGIN CATCH
+    SELECT ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+END CATCH;
+SELECT SeatsSold FROM dbo.Screenings WHERE ScreeningID = 1;
+
+-- 3a. Screening already started. Expected: error 50002
+BEGIN TRY
+    EXEC dbo.usp_BookSeats @ScreeningID = 4, @CustomerID = 1, @Seats = 1, @BookingID = @tmp OUTPUT;
+END TRY
+BEGIN CATCH
+    SELECT ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+END CATCH;
+
+-- 3b. 0 seats booked, future screening, Expected: error 50004
+BEGIN TRY
+    EXEC dbo.usp_BookSeats @ScreeningID = 2, @CustomerID = 1, @Seats = 0, @BookingID = @tmp OUTPUT;
+END TRY
+BEGIN CATCH
+    SELECT ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+END CATCH;
+
+-- 4. Pay, then pay again. Expected: Paid, then error 50010
+EXEC dbo.usp_PayBooking @BookingID = @b1;
+SELECT BookingID, Status, PaidAt FROM dbo.Bookings WHERE BookingID = @b1;
+BEGIN TRY
+    EXEC dbo.usp_PayBooking @BookingID = @b1;
+END TRY
+BEGIN CATCH
+    SELECT ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+END CATCH;
+
+-- 5. Cancel with DELETE. Expected: row still there as Cancelled, SeatsSold = 0,
+--    3 log rows (NULL->Reserved, Reserved->Paid, Paid->Cancelled)
+DELETE FROM dbo.Bookings WHERE BookingID = @b1;
+SELECT BookingID, Status FROM dbo.Bookings WHERE BookingID = @b1;
+SELECT SeatsSold FROM dbo.Screenings WHERE ScreeningID = 1;
+SELECT LogID, BookingID, OldStatus, NewStatus FROM dbo.BookingLog WHERE BookingID = @b1 ORDER BY LogID;
+
+-- 6. Two bookings in one INSERT, no procedure. Expected: SeatsSold of screening 2 = 5
+INSERT dbo.Bookings (ScreeningID, CustomerID, Seats, TotalPrice) VALUES
+(2, 3, 2, 24.00),
+(2, 4, 3, 36.00);
+SELECT SeatsSold FROM dbo.Screenings WHERE ScreeningID = 2;
+
+-- 7. Expire a reservation. Expected: Expired, SeatsSold = 3 (only the 3-seat booking left),
+--    @ExpiredCount = 1, newest JobRunLog row has ExpiredCount = 1
+SELECT @b6 = MIN(BookingID) FROM dbo.Bookings WHERE ScreeningID = 2;
+UPDATE dbo.Bookings SET CreatedAt = DATEADD(MINUTE, -30, CreatedAt) WHERE BookingID = @b6;
+EXEC dbo.usp_ExpireReservations @ExpiredCount = @expired OUTPUT;
+SELECT BookingID, Status FROM dbo.Bookings WHERE BookingID = @b6;
+SELECT SeatsSold FROM dbo.Screenings WHERE ScreeningID = 2;
+SELECT @expired AS ExpiredCount;
+SELECT TOP (1) * FROM dbo.JobRunLog ORDER BY RunID DESC;
+
+-- 8. Report. Setup: screening 1 gets a paid booking of 2 seats (30.00)
+EXEC dbo.usp_BookSeats @ScreeningID = 1, @CustomerID = 5, @Seats = 2, @BookingID = @b8 OUTPUT;
+EXEC dbo.usp_PayBooking @BookingID = @b8;
+
+-- 8a. No parameters. Expected: 4 rows; screening 1: SeatsSold 2, FreeSeats 8, PaidRevenue 30.00;
+--     screening 2: SeatsSold 3, FreeSeats 3, PaidRevenue 0
+EXEC dbo.usp_GetScreeningReport;
+-- 8b. Only future screenings. Expected: screenings 1, 2, 3
+EXEC dbo.usp_GetScreeningReport @FromDate = @tomorrow;
+-- 8c. Movie 1 only. Expected: screenings 1 and 4
+EXEC dbo.usp_GetScreeningReport @MovieID = 1;
+-- 8d. Both filters. Expected: screening 1 only
+EXEC dbo.usp_GetScreeningReport @FromDate = @today, @MovieID = 1;
