@@ -278,9 +278,7 @@ begin
 		inner join @AffectedScreenings a on a.ScreeningID=s.ScreeningID
 		where s.SeatsSold>h.SeatCount
 	)
-	begin
 		throw 50020, N'Not enough seats in the hall.', 1;
-	end;
 end;
 go
 
@@ -318,9 +316,7 @@ end;
 go
 
 
--- =====================================================================
 -- STEP 4: Expiring reservations + SQL Server Agent job
--- =====================================================================
 
 -- 4a. Expire Reserved bookings older than @OlderThanMinutes
 CREATE OR ALTER PROCEDURE dbo.usp_ExpireReservations
@@ -392,7 +388,9 @@ EXEC msdb.dbo.sp_add_jobserver
      @job_name    = N'KinoDB - Expire reservations',
      @server_name = N'(local)';
 GO
--- Testcases 
+
+
+-- STEP 5: TESTS
 
 DECLARE @b1 INT, @b6 INT, @b8 INT, @expired INT, @tmp INT,
         @today DATE = CAST(GETDATE() AS DATE),
@@ -454,6 +452,8 @@ SELECT SeatsSold FROM dbo.Screenings WHERE ScreeningID = 2;
 
 -- 7. Expire a reservation. Expected: Expired, SeatsSold = 3 (only the 3-seat booking left),
 --    @ExpiredCount = 1, newest JobRunLog row has ExpiredCount = 1
+--    (if the Agent job runs between the UPDATE and the EXEC, it expires the row first
+--     and @ExpiredCount is 0; the Status is still Expired)
 SELECT @b6 = MIN(BookingID) FROM dbo.Bookings WHERE ScreeningID = 2;
 UPDATE dbo.Bookings SET CreatedAt = DATEADD(MINUTE, -30, CreatedAt) WHERE BookingID = @b6;
 EXEC dbo.usp_ExpireReservations @ExpiredCount = @expired OUTPUT;
